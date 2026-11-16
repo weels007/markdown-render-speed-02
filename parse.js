@@ -697,6 +697,40 @@ function cachedLastPossibleDelCloserIndex(lx, maskedSrc) {
   return scanLastPossibleEmStrongDelClosers(maskedSrc).lastPossibleDelCloserIndex;
 }
 
+// Code-point counting without the array a spread allocates. Delimiter runs are
+// ASCII, so the only thing that changes the count is a surrogate pair.
+function cpLen(s) {
+  const len = s.length;
+  let n = len;
+  for (let i = 0; i < len; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0xDC00 && c <= 0xDFFF && i > 0) {
+      const p = s.charCodeAt(i - 1);
+      if (p >= 0xD800 && p <= 0xDBFF) n--;
+    }
+  }
+  return n;
+}
+
+// Length in code units of the first code point of s.
+function firstCpLen(s) {
+  const c = s.charCodeAt(0);
+  return c >= 0xD800 && c <= 0xDBFF && s.length > 1
+    && s.charCodeAt(1) >= 0xDC00 && s.charCodeAt(1) <= 0xDFFF ? 2 : 1;
+}
+
+// The code point ending just before pos (the last element of
+// [...src.slice(0, pos)]), without building the slice or the array.
+function codePointBefore(src, pos) {
+  if (pos <= 0) return '';
+  const c = src.charCodeAt(pos - 1);
+  if (c >= 0xDC00 && c <= 0xDFFF && pos >= 2) {
+    const p = src.charCodeAt(pos - 2);
+    if (p >= 0xD800 && p <= 0xDBFF) return src.slice(pos - 2, pos);
+  }
+  return src.charAt(pos - 1);
+}
+
 function expandTabs(line, indent = 0) {
   let col = indent;
   let expanded = '';
@@ -956,11 +990,8 @@ function isBlankLine(s) {
 // Same verdict as `src.includes('*') || src.includes('_') || src.includes('~')`
 // in a single scan.
 function hasEmDelim(src) {
-  for (let i = 0; i < src.length; i++) {
-    const cc = src.charCodeAt(i);
-    if (cc === 42 || cc === 95 || cc === 126) return true;
-  }
-  return false;
+  // Native scans beat a charCodeAt loop for the long paragraphs in the docs.
+  return src.includes('*') || src.includes('_') || src.includes('~');
 }
 
 function firstLineOf(src) {
@@ -1639,8 +1670,7 @@ function emStrongToken(lx, src, maskedSrc, prevChar = '') {
   while (runStart > 0 && maskedSrc[runStart - 1] === delimChar) {
     runStart--;
   }
-  const runPrevChars = [...maskedSrc.slice(Math.max(0, runStart - 2), runStart)];
-  const runPrevChar = runPrevChars.length > 0 ? runPrevChars[runPrevChars.length - 1] : '';
+  const runPrevChar = codePointBefore(maskedSrc, runStart);
   // The other delimiter character counts as punctuation here (`_**a*`)
   const runPrevPunct = runPrevChar === '*' || runPrevChar === '_' || !!inline.punctuation.exec(runPrevChar);
   if (runStart < srcStart) {
@@ -1654,8 +1684,8 @@ function emStrongToken(lx, src, maskedSrc, prevChar = '') {
   const nextChar = match[1] || match[3] || '';
 
   if (!nextChar || !prevChar || prevPunct) {
-    // unicode Regex counts emoji as 1 char; spread into array for proper count (used multiple times below)
-    const lLength = [...match[0]].length - 1;
+    // Count code points, not UTF-16 units: a regex match can hold an astral char.
+    const lLength = cpLen(match[0]) - 1;
     let rDelim, rLength, delimTotal = lLength, midDelimTotal = 0;
 
     // Rules 9-10 count the whole run, and also apply when the opener could
@@ -1679,7 +1709,8 @@ function emStrongToken(lx, src, maskedSrc, prevChar = '') {
 
       if (!rDelim) continue; // skip single * in __abc*abc__
 
-      rLength = [...rDelim].length;
+      // rDelim is always a run of the ASCII delimiter (*, _ or ~).
+      rLength = rDelim.length;
 
       if (match[3] || match[4]) { // found another Left Delim
         delimTotal += rLength;
@@ -1703,7 +1734,7 @@ function emStrongToken(lx, src, maskedSrc, prevChar = '') {
       // Remove extra characters. *a*** -> *a*
       rLength = Math.min(rLength, rLength + delimTotal + midDelimTotal);
       // char length can be >1 for unicode characters;
-      const lastCharLength = [...match[0]][0].length;
+      const lastCharLength = firstCpLen(match[0]);
       const raw = src.slice(0, lLength + match.index + lastCharLength + rLength);
 
       // Create `em` if smallest delimiter has odd char count. *a***
@@ -1763,8 +1794,8 @@ function delToken(lx, src, maskedSrc, prevChar = '') {
   const nextChar = match[1] || '';
 
   if (!nextChar || !prevChar || inline.punctuation.exec(prevChar)) {
-    // unicode Regex counts emoji as 1 char; spread into array for proper count
-    const lLength = [...match[0]].length - 1;
+    // Count code points, not UTF-16 units: a regex match can hold an astral char.
+    const lLength = cpLen(match[0]) - 1;
     let rDelim, rLength, delimTotal = lLength;
 
     const endReg = inline.delRDelim;
@@ -1782,7 +1813,8 @@ function delToken(lx, src, maskedSrc, prevChar = '') {
 
       if (!rDelim) continue;
 
-      rLength = [...rDelim].length;
+      // rDelim is always a run of the ASCII delimiter (*, _ or ~).
+      rLength = rDelim.length;
 
       if (rLength !== lLength) continue;
 
@@ -1798,7 +1830,7 @@ function delToken(lx, src, maskedSrc, prevChar = '') {
       // Remove extra characters
       rLength = Math.min(rLength, rLength + delimTotal);
       // char length can be >1 for unicode characters
-      const lastCharLength = [...match[0]][0].length;
+      const lastCharLength = firstCpLen(match[0]);
       const raw = src.slice(0, lLength + match.index + lastCharLength + rLength);
 
       // Create del token - only single ~ or double ~~ supported
@@ -1972,8 +2004,11 @@ function maskSrc(lx, src) {
   // String with links masked to avoid interference with em and strong
   let maskedSrc = src;
 
-  // One scan of src for the three characters the pass guards below test.
+  // One scan of src for the characters the pass guards below test. The
+  // reflink search needs '[' and ']' and, because every candidate it cannot
+  // resolve is returned unchanged, also a link definition to be worth a pass.
   let hasBracket = false;
+  let hasRBracket = false;
   let hasBackslash = false;
   let hasBacktick = false;
   for (let i = 0; i < src.length; i++) {
@@ -1981,10 +2016,11 @@ function maskSrc(lx, src) {
     if (cc === 91) hasBracket = true; // [
     else if (cc === 92) hasBackslash = true; // \
     else if (cc === 96) hasBacktick = true; // `
+    else if (cc === 93) hasRBracket = true; // ]
   }
 
   // Mask out reflinks
-  if (hasBracket) {
+  if (hasBracket && hasRBracket && lx.linkCount > 0) {
     const reflinkSearch = inline.reflinkSearch;
     const maskReflink = (match0) => {
       const refStart = match0.lastIndexOf('[');
@@ -2028,20 +2064,29 @@ function maskSrc(lx, src) {
     });
   }
 
-  // Mask out other blocks: link (needs '['), code (needs '`'), html (needs '<')
-  // The guard tests the masked string: earlier masks may have removed a '<'
-  // (a masked html span) or added one nothing else can remove, so this is
-  // scanned after the passes above rather than fused with the src scan.
-  let mbBracket = false;
-  let mbBacktick = false;
-  let mbLt = false;
+  // Mask out other blocks: link (needs '[' ']' '(' ')'), code (needs a pair
+  // of backticks), html (needs '<' and '>'). The guard tests the masked
+  // string: earlier masks may have removed a '<' (a masked html span) or an
+  // escaped bracket, so this is scanned after the passes above rather than
+  // fused with the src scan.
+  let mbBracket = false; // [
+  let mbRBracket = false; // ]
+  let mbParen = false; // (
+  let mbRParen = false; // )
+  let mbLt = false; // <
+  let mbGt = false; // >
+  let mbTicks = 0; // `
   for (let i = 0; i < maskedSrc.length; i++) {
     const cc = maskedSrc.charCodeAt(i);
-    if (cc === 91) mbBracket = true; // [
-    else if (cc === 96) mbBacktick = true; // `
-    else if (cc === 60) mbLt = true; // <
+    if (cc === 91) mbBracket = true;
+    else if (cc === 93) mbRBracket = true;
+    else if (cc === 40) mbParen = true;
+    else if (cc === 41) mbRParen = true;
+    else if (cc === 60) mbLt = true;
+    else if (cc === 62) mbGt = true;
+    else if (cc === 96) mbTicks++;
   }
-  if (mbBracket || mbBacktick || mbLt) {
+  if ((mbBracket && mbRBracket && mbParen && mbRParen) || mbTicks >= 2 || (mbLt && mbGt)) {
     maskedSrc = maskedSrc.replace(inline.blockSkip, (match0, _link, context) => {
       const offset = context ? context.length : 0;
       return match0.slice(0, offset) + '[' + 'a'.repeat(match0.length - offset - 2) + ']';
@@ -2146,6 +2191,7 @@ function blockTokens(lx, src, tokens, lastParagraphClipped = false) {
       } else {
         // The first definition of a label wins, but a later one still consumes its text
         if (!lx.links[token.tag]) {
+          lx.linkCount++;
           lx.links[token.tag] = {
             href: token.href,
             title: token.title,
@@ -2663,6 +2709,7 @@ function parseMarkdown(markdown) {
 
   const lx = {
     links: Object.create(null),
+    linkCount: 0,
     inlineQueue: [],
     inLink: false,
     inRawBlock: false,
