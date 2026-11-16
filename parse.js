@@ -2207,6 +2207,12 @@ function tokenizeInlines(lx, src, maskedSrc, tokens) {
           tokens.push(token);
           continue;
         }
+        // url (gfm) — an extended email autolink can start at `_`
+        if (c === 95 && !lx.inLink && (token = urlToken(lx, src))) {
+          src = src.substring(token.raw.length);
+          tokens.push(token);
+          continue;
+        }
         break;
       }
       case 96: { // `
