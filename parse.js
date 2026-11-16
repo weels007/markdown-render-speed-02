@@ -697,40 +697,6 @@ function cachedLastPossibleDelCloserIndex(lx, maskedSrc) {
   return scanLastPossibleEmStrongDelClosers(maskedSrc).lastPossibleDelCloserIndex;
 }
 
-// Code-point counting without the array a spread allocates. Delimiter runs are
-// ASCII, so the only thing that changes the count is a surrogate pair.
-function cpLen(s) {
-  const len = s.length;
-  let n = len;
-  for (let i = 0; i < len; i++) {
-    const c = s.charCodeAt(i);
-    if (c >= 0xDC00 && c <= 0xDFFF && i > 0) {
-      const p = s.charCodeAt(i - 1);
-      if (p >= 0xD800 && p <= 0xDBFF) n--;
-    }
-  }
-  return n;
-}
-
-// Length in code units of the first code point of s.
-function firstCpLen(s) {
-  const c = s.charCodeAt(0);
-  return c >= 0xD800 && c <= 0xDBFF && s.length > 1
-    && s.charCodeAt(1) >= 0xDC00 && s.charCodeAt(1) <= 0xDFFF ? 2 : 1;
-}
-
-// The code point ending just before pos (the last element of
-// [...src.slice(0, pos)]), without building the slice or the array.
-function codePointBefore(src, pos) {
-  if (pos <= 0) return '';
-  const c = src.charCodeAt(pos - 1);
-  if (c >= 0xDC00 && c <= 0xDFFF && pos >= 2) {
-    const p = src.charCodeAt(pos - 2);
-    if (p >= 0xD800 && p <= 0xDBFF) return src.slice(pos - 2, pos);
-  }
-  return src.charAt(pos - 1);
-}
-
 function expandTabs(line, indent = 0) {
   let col = indent;
   let expanded = '';
@@ -990,8 +956,11 @@ function isBlankLine(s) {
 // Same verdict as `src.includes('*') || src.includes('_') || src.includes('~')`
 // in a single scan.
 function hasEmDelim(src) {
-  // Native scans beat a charCodeAt loop for the long paragraphs in the docs.
-  return src.includes('*') || src.includes('_') || src.includes('~');
+  for (let i = 0; i < src.length; i++) {
+    const cc = src.charCodeAt(i);
+    if (cc === 42 || cc === 95 || cc === 126) return true;
+  }
+  return false;
 }
 
 function firstLineOf(src) {
@@ -1670,7 +1639,8 @@ function emStrongToken(lx, src, maskedSrc, prevChar = '') {
   while (runStart > 0 && maskedSrc[runStart - 1] === delimChar) {
     runStart--;
   }
-  const runPrevChar = codePointBefore(maskedSrc, runStart);
+  const runPrevChars = [...maskedSrc.slice(Math.max(0, runStart - 2), runStart)];
+  const runPrevChar = runPrevChars.length > 0 ? runPrevChars[runPrevChars.length - 1] : '';
   // The other delimiter character counts as punctuation here (`_**a*`)
   const runPrevPunct = runPrevChar === '*' || runPrevChar === '_' || !!inline.punctuation.exec(runPrevChar);
   if (runStart < srcStart) {
@@ -1684,8 +1654,8 @@ function emStrongToken(lx, src, maskedSrc, prevChar = '') {
   const nextChar = match[1] || match[3] || '';
 
   if (!nextChar || !prevChar || prevPunct) {
-    // Count code points, not UTF-16 units: a regex match can hold an astral char.
-    const lLength = cpLen(match[0]) - 1;
+    // unicode Regex counts emoji as 1 char; spread into array for proper count (used multiple times below)
+    const lLength = [...match[0]].length - 1;
     let rDelim, rLength, delimTotal = lLength, midDelimTotal = 0;
 
     // Rules 9-10 count the whole run, and also apply when the opener could
@@ -1709,8 +1679,7 @@ function emStrongToken(lx, src, maskedSrc, prevChar = '') {
 
       if (!rDelim) continue; // skip single * in __abc*abc__
 
-      // rDelim is always a run of the ASCII delimiter (*, _ or ~).
-      rLength = rDelim.length;
+      rLength = [...rDelim].length;
 
       if (match[3] || match[4]) { // found another Left Delim
         delimTotal += rLength;
@@ -1734,7 +1703,7 @@ function emStrongToken(lx, src, maskedSrc, prevChar = '') {
       // Remove extra characters. *a*** -> *a*
       rLength = Math.min(rLength, rLength + delimTotal + midDelimTotal);
       // char length can be >1 for unicode characters;
-      const lastCharLength = firstCpLen(match[0]);
+      const lastCharLength = [...match[0]][0].length;
       const raw = src.slice(0, lLength + match.index + lastCharLength + rLength);
 
       // Create `em` if smallest delimiter has odd char count. *a***
@@ -1794,8 +1763,8 @@ function delToken(lx, src, maskedSrc, prevChar = '') {
   const nextChar = match[1] || '';
 
   if (!nextChar || !prevChar || inline.punctuation.exec(prevChar)) {
-    // Count code points, not UTF-16 units: a regex match can hold an astral char.
-    const lLength = cpLen(match[0]) - 1;
+    // unicode Regex counts emoji as 1 char; spread into array for proper count
+    const lLength = [...match[0]].length - 1;
     let rDelim, rLength, delimTotal = lLength;
 
     const endReg = inline.delRDelim;
@@ -1813,8 +1782,7 @@ function delToken(lx, src, maskedSrc, prevChar = '') {
 
       if (!rDelim) continue;
 
-      // rDelim is always a run of the ASCII delimiter (*, _ or ~).
-      rLength = rDelim.length;
+      rLength = [...rDelim].length;
 
       if (rLength !== lLength) continue;
 
@@ -1830,7 +1798,7 @@ function delToken(lx, src, maskedSrc, prevChar = '') {
       // Remove extra characters
       rLength = Math.min(rLength, rLength + delimTotal);
       // char length can be >1 for unicode characters
-      const lastCharLength = firstCpLen(match[0]);
+      const lastCharLength = [...match[0]][0].length;
       const raw = src.slice(0, lLength + match.index + lastCharLength + rLength);
 
       // Create del token - only single ~ or double ~~ supported
