@@ -2118,6 +2118,11 @@ function maskSrc(lx, src) {
 
 function blockTokens(lx, src, tokens, lastParagraphClipped = false) {
   let srcLength = Infinity;
+  // These guards only ever get cheaper as `src` shrinks, so decide them once
+  // for the whole pass instead of rescanning the remaining source each step.
+  const hasDash = src.includes('-');
+  const hasNewline = src.includes('\n');
+  const maySetext = hasNewline && mayEndSetext(src);
   while (src) {
     if (src.length < srcLength) {
       srcLength = src.length;
@@ -2223,7 +2228,7 @@ function blockTokens(lx, src, tokens, lastParagraphClipped = false) {
     }
 
     // table (gfm): the align row requires a '-' and a '\n'
-    if (c0 !== 10 && src.indexOf('-') !== -1 && src.indexOf('\n') !== -1 && (token = tableToken(lx, src))) {
+    if (c0 !== 10 && hasDash && hasNewline && (token = tableToken(lx, src))) {
       src = src.substring(token.raw.length);
       tokens.push(token);
       continue;
@@ -2231,7 +2236,7 @@ function blockTokens(lx, src, tokens, lastParagraphClipped = false) {
 
     // lheading: the underline is '\n' + 0-3 spaces + '='/'-', so without such a
     // spot the rule cannot match
-    if (mayEndSetext(src) && (token = lheadingToken(lx, src))) {
+    if (maySetext && (token = lheadingToken(lx, src))) {
       src = src.substring(token.raw.length);
       tokens.push(token);
       continue;
