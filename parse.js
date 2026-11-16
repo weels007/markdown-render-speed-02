@@ -935,6 +935,30 @@ function blockquoteToken(lx, src) {
   }
 }
 
+// src.split('\n', 1)[0] without the array allocation
+function firstLineOf(src) {
+  const nl = src.indexOf('\n');
+  return nl === -1 ? src : src.slice(0, nl);
+}
+
+// index of the first character that is not a space, or -1 (same as
+// str.search(/[^ ]/) but without the regex call)
+function indexOfNonSpace(str) {
+  for (let i = 0; i < str.length; i++) {
+    if (str.charCodeAt(i) !== 32) return i;
+  }
+  return -1;
+}
+
+// The character a `^ {0,n}X` rule would test: the first non-space character at
+// position <= n, or -1 when the rule cannot match (NaN past the end also
+// fails every target check)
+function indentChar(line, n) {
+  let i = 0;
+  while (i < n && line.charCodeAt(i) === 32) i++;
+  return i <= n ? line.charCodeAt(i) : -1;
+}
+
 function listToken(lx, src) {
   let cap = block.list.exec(src);
   if (cap) {
@@ -967,24 +991,25 @@ function listToken(lx, src) {
         break;
       }
 
-      if (block.hr.test(src)) { // End list if bullet was actually HR (possibly move into itemRegex?)
+      if ((src.charCodeAt(0) === 32 || src.charCodeAt(0) === 45 || src.charCodeAt(0) === 95 || src.charCodeAt(0) === 42) && block.hr.test(src)) { // End list if bullet was actually HR (possibly move into itemRegex?)
         break;
       }
 
       const itemStart = taken();
       src = src.substring(cap[0].length);
 
-      const firstLine = cap[2].split('\n', 1)[0];
+      const firstLine = firstLineOf(cap[2]);
       const bulletIndent = cap[1].length;
-      let line = firstLine.replace(other.leadingSpaceTab, whitespace => expandTabs(whitespace, bulletIndent));
-      let nextLine = src.split('\n', 1)[0];
+      const fc = firstLine.charCodeAt(0);
+      let line = (fc === 32 || fc === 9) ? firstLine.replace(other.leadingSpaceTab, whitespace => expandTabs(whitespace, bulletIndent)) : firstLine;
+      let nextLine = firstLineOf(src);
       let blankLine = !line.trim();
 
       let indent = 0;
       if (blankLine) {
         indent = bulletIndent + 1;
       } else {
-        indent = line.search(other.nonSpaceChar); // Find first non-space char
+        indent = indexOfNonSpace(line); // Find first non-space char
         indent = indent > 4 ? 1 : indent; // Treat indented code blocks (> 4 spaces) as having only 1 indent
         itemContents = line.slice(indent);
         indent += bulletIndent;
@@ -1002,47 +1027,56 @@ function listToken(lx, src) {
         const headingBeginRegex = other.headingBeginRegex(indent);
         const htmlBeginRegex = other.htmlBeginRegex(indent);
         const blockquoteBeginRegex = other.blockquoteBeginRegex(indent);
+        // effective indent used by the cached indent regexes (clamped, bug-compatible)
+        const nEff = indent > 4 ? 3 : indent - 1 < 0 ? 0 : indent - 1;
 
         // Check if following lines should be included in List Item
         while (src) {
-          const rawLine = src.split('\n', 1)[0];
+          const rawLine = firstLineOf(src);
           let nextLineWithoutTabs;
           nextLine = rawLine;
 
           // Re-align to follow commonmark nesting rules
-          nextLineWithoutTabs = nextLine.replace(other.leadingSpaceTab, whitespace => expandTabs(whitespace));
+          const nc = nextLine.charCodeAt(0);
+          nextLineWithoutTabs = (nc === 32 || nc === 9) ? nextLine.replace(other.leadingSpaceTab, whitespace => expandTabs(whitespace)) : nextLine;
+
+          // The break tests below use `^ {0,clampedIndent}<start char>` rules, so
+          // the first non-space character within the indent decides whether each
+          // rule can match at all; the tests are order-independent breaks.
+          const lead = indentChar(nextLine, nEff);
 
           // End list item if found code fences
-          if (fencesBeginRegex.test(nextLine)) {
+          if ((lead === 96 || lead === 126) && fencesBeginRegex.test(nextLine)) {
             break;
           }
 
           // End list item if found start of new heading
-          if (headingBeginRegex.test(nextLine)) {
+          if (lead === 35 && headingBeginRegex.test(nextLine)) {
             break;
           }
 
           // End list item if found start of html block
-          if (htmlBeginRegex.test(nextLine)) {
+          if (lead === 60 && htmlBeginRegex.test(nextLine)) {
             break;
           }
 
           // End list item if found start of blockquote
-          if (blockquoteBeginRegex.test(nextLine)) {
+          if (lead === 62 && blockquoteBeginRegex.test(nextLine)) {
             break;
           }
 
           // End list item if found start of new bullet
-          if (nextBulletRegex.test(nextLine)) {
+          if ((lead === 42 || lead === 43 || lead === 45 || (lead >= 48 && lead <= 57)) && nextBulletRegex.test(nextLine)) {
             break;
           }
 
           // Horizontal rule found
-          if (hrRegex.test(nextLine)) {
+          if ((lead === 45 || lead === 95 || lead === 42) && hrRegex.test(nextLine)) {
             break;
           }
 
-          if (nextLineWithoutTabs.search(other.nonSpaceChar) >= indent || !nextLine.trim()) { // Dedent if possible
+          const nsIdx = indexOfNonSpace(nextLineWithoutTabs);
+          if ((nsIdx !== -1 && nsIdx >= indent) || !nextLine.trim()) { // Dedent if possible
             itemContents += '\n' + nextLineWithoutTabs.slice(indent);
           } else {
             // not enough indentation
@@ -1051,19 +1085,21 @@ function listToken(lx, src) {
             }
 
             // paragraph continuation unless last line was a different block level element
-            if (line.replace(other.tabCharGlobal, '    ').search(other.nonSpaceChar) >= 4) { // indented code block
+            const tIdx = indexOfNonSpace(line.replace(other.tabCharGlobal, '    '));
+            if (tIdx !== -1 && tIdx >= 4) { // indented code block
               break;
             }
-            if (fencesBeginRegex.test(line)) {
+            const lineLead = indentChar(line, nEff);
+            if ((lineLead === 96 || lineLead === 126) && fencesBeginRegex.test(line)) {
               break;
             }
-            if (headingBeginRegex.test(line)) {
+            if (lineLead === 35 && headingBeginRegex.test(line)) {
               break;
             }
-            if (htmlBeginRegex.test(line)) {
+            if (lineLead === 60 && htmlBeginRegex.test(line)) {
               break;
             }
-            if (hrRegex.test(line)) {
+            if ((lineLead === 45 || lineLead === 95 || lineLead === 42) && hrRegex.test(line)) {
               break;
             }
 
@@ -1828,6 +1864,27 @@ function infiniteLoopError(byte) {
   throw new Error('Infinite loop on byte: ' + byte);
 }
 
+// Necessary condition for the gfm setext rule: some '\n' followed by at most
+// three spaces and then '=' or '-' (the underline). Cheap indexOf scan that
+// avoids the heavy lheading regex on ordinary paragraphs.
+function mayEndSetext(src) {
+  let i = src.indexOf('\n');
+  while (i !== -1) {
+    let j = i + 1;
+    let spaces = 0;
+    while (j < src.length && src.charCodeAt(j) === 32 && spaces < 3) {
+      j++;
+      spaces++;
+    }
+    const cc = src.charCodeAt(j);
+    if (cc === 61 || cc === 45) {
+      return true;
+    }
+    i = src.indexOf('\n', j);
+  }
+  return false;
+}
+
 /**
  * Does this link text hold a link already? An image does not count: an image
  * may hold a link, a link may not.
@@ -1901,21 +1958,27 @@ function maskSrc(lx, src) {
   // unicode punctuation, so an escaped astral character is 3 code units.
   // A backslash inside a code span is literal, not an escape. Mask the
   // backticks inside the span instead, so blockSkip still skips all of it.
-  maskedSrc = maskedSrc.replace(inline.anyPunctuationOutsideCode, (match0, code, punct) => {
-    if (punct) {
-      return '+'.repeat(match0.length);
-    }
-    if (code) {
-      return code + match0.slice(code.length, -code.length).replace(/`/g, '+') + code;
-    }
-    return match0;
-  });
+  // The rule can only match at a backslash or a backtick, so skip the global
+  // pass when there is neither.
+  if (src.indexOf('\\') !== -1 || src.indexOf('`') !== -1) {
+    maskedSrc = maskedSrc.replace(inline.anyPunctuationOutsideCode, (match0, code, punct) => {
+      if (punct) {
+        return '+'.repeat(match0.length);
+      }
+      if (code) {
+        return code + match0.slice(code.length, -code.length).replace(/`/g, '+') + code;
+      }
+      return match0;
+    });
+  }
 
-  // Mask out other blocks
-  maskedSrc = maskedSrc.replace(inline.blockSkip, (match0, _link, context) => {
-    const offset = context ? context.length : 0;
-    return match0.slice(0, offset) + '[' + 'a'.repeat(match0.length - offset - 2) + ']';
-  });
+  // Mask out other blocks: link (needs '['), code (needs '`'), html (needs '<')
+  if (maskedSrc.indexOf('[') !== -1 || maskedSrc.indexOf('`') !== -1 || maskedSrc.indexOf('<') !== -1) {
+    maskedSrc = maskedSrc.replace(inline.blockSkip, (match0, _link, context) => {
+      const offset = context ? context.length : 0;
+      return match0.slice(0, offset) + '[' + 'a'.repeat(match0.length - offset - 2) + ']';
+    });
+  }
 
   return maskedSrc;
 }
@@ -2025,15 +2088,16 @@ function blockTokens(lx, src, tokens, lastParagraphClipped = false) {
       continue;
     }
 
-    // table (gfm)
-    if (c0 !== 10 && (token = tableToken(lx, src))) {
+    // table (gfm): the align row requires a '-' and a '\n'
+    if (c0 !== 10 && src.indexOf('-') !== -1 && src.indexOf('\n') !== -1 && (token = tableToken(lx, src))) {
       src = src.substring(token.raw.length);
       tokens.push(token);
       continue;
     }
 
-    // lheading
-    if ((token = lheadingToken(lx, src))) {
+    // lheading: the underline is '\n' + 0-3 spaces + '='/'-', so without such a
+    // spot the rule cannot match
+    if (mayEndSetext(src) && (token = lheadingToken(lx, src))) {
       src = src.substring(token.raw.length);
       tokens.push(token);
       continue;
