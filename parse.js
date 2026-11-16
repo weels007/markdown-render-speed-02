@@ -936,6 +936,33 @@ function blockquoteToken(lx, src) {
 }
 
 // src.split('\n', 1)[0] without the array allocation
+// True when every character of s is whitespace in String.prototype.trim's
+// sense (WhiteSpace or LineTerminator); replaces `!s.trim()` without
+// allocating the trimmed substring.
+function isBlankLine(s) {
+  for (let i = 0; i < s.length; i++) {
+    const cc = s.charCodeAt(i);
+    if (cc === 32 || cc === 9 || cc === 10 || cc === 11 || cc === 12 || cc === 13
+      || cc === 0xA0 || cc === 0x1680 || (cc >= 0x2000 && cc <= 0x200A)
+      || cc === 0x2028 || cc === 0x2029 || cc === 0x202F || cc === 0x205F
+      || cc === 0x3000 || cc === 0xFEFF) {
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+// Same verdict as `src.includes('*') || src.includes('_') || src.includes('~')`
+// in a single scan.
+function hasEmDelim(src) {
+  for (let i = 0; i < src.length; i++) {
+    const cc = src.charCodeAt(i);
+    if (cc === 42 || cc === 95 || cc === 126) return true;
+  }
+  return false;
+}
+
 function firstLineOf(src) {
   const nl = src.indexOf('\n');
   return nl === -1 ? src : src.slice(0, nl);
@@ -1001,9 +1028,19 @@ function listToken(lx, src) {
       const firstLine = firstLineOf(cap[2]);
       const bulletIndent = cap[1].length;
       const fc = firstLine.charCodeAt(0);
-      let line = (fc === 32 || fc === 9) ? firstLine.replace(other.leadingSpaceTab, whitespace => expandTabs(whitespace, bulletIndent)) : firstLine;
+      // The leading-whitespace replace only ever changes tabs (expandTabs
+      // copies spaces verbatim), so skip it when the leading run is spaces.
+      let line = firstLine;
+      if (fc === 32 || fc === 9) {
+        let r = 0;
+        const fl = firstLine.length;
+        while (r < fl && firstLine.charCodeAt(r) === 32) r++;
+        if (r < fl && firstLine.charCodeAt(r) === 9) {
+          line = firstLine.replace(other.leadingSpaceTab, whitespace => expandTabs(whitespace, bulletIndent));
+        }
+      }
       let nextLine = firstLineOf(src);
-      let blankLine = !line.trim();
+      let blankLine = isBlankLine(line);
 
       let indent = 0;
       if (blankLine) {
@@ -1038,7 +1075,15 @@ function listToken(lx, src) {
 
           // Re-align to follow commonmark nesting rules
           const nc = nextLine.charCodeAt(0);
-          nextLineWithoutTabs = (nc === 32 || nc === 9) ? nextLine.replace(other.leadingSpaceTab, whitespace => expandTabs(whitespace)) : nextLine;
+          nextLineWithoutTabs = nextLine;
+          if (nc === 32 || nc === 9) {
+            let r = 0;
+            const nl = nextLine.length;
+            while (r < nl && nextLine.charCodeAt(r) === 32) r++;
+            if (r < nl && nextLine.charCodeAt(r) === 9) {
+              nextLineWithoutTabs = nextLine.replace(other.leadingSpaceTab, whitespace => expandTabs(whitespace));
+            }
+          }
 
           // The break tests below use `^ {0,clampedIndent}<start char>` rules, so
           // the first non-space character within the indent decides whether each
@@ -1076,7 +1121,7 @@ function listToken(lx, src) {
           }
 
           const nsIdx = indexOfNonSpace(nextLineWithoutTabs);
-          if ((nsIdx !== -1 && nsIdx >= indent) || !nextLine.trim()) { // Dedent if possible
+          if ((nsIdx !== -1 && nsIdx >= indent) || isBlankLine(nextLine)) { // Dedent if possible
             itemContents += '\n' + nextLineWithoutTabs.slice(indent);
           } else {
             // not enough indentation
@@ -1113,7 +1158,7 @@ function listToken(lx, src) {
             itemContents += '\n' + continuation;
           }
 
-          blankLine = !nextLine.trim();
+          blankLine = isBlankLine(nextLine);
 
           src = src.substring(rawLine.length + 1);
           line = nextLineWithoutTabs.slice(indent);
@@ -1927,8 +1972,19 @@ function maskSrc(lx, src) {
   // String with links masked to avoid interference with em and strong
   let maskedSrc = src;
 
+  // One scan of src for the three characters the pass guards below test.
+  let hasBracket = false;
+  let hasBackslash = false;
+  let hasBacktick = false;
+  for (let i = 0; i < src.length; i++) {
+    const cc = src.charCodeAt(i);
+    if (cc === 91) hasBracket = true; // [
+    else if (cc === 92) hasBackslash = true; // \
+    else if (cc === 96) hasBacktick = true; // `
+  }
+
   // Mask out reflinks
-  if (src.includes('[')) {
+  if (hasBracket) {
     const reflinkSearch = inline.reflinkSearch;
     const maskReflink = (match0) => {
       const refStart = match0.lastIndexOf('[');
@@ -1960,7 +2016,7 @@ function maskSrc(lx, src) {
   // backticks inside the span instead, so blockSkip still skips all of it.
   // The rule can only match at a backslash or a backtick, so skip the global
   // pass when there is neither.
-  if (src.indexOf('\\') !== -1 || src.indexOf('`') !== -1) {
+  if (hasBackslash || hasBacktick) {
     maskedSrc = maskedSrc.replace(inline.anyPunctuationOutsideCode, (match0, code, punct) => {
       if (punct) {
         return '+'.repeat(match0.length);
@@ -1973,7 +2029,19 @@ function maskSrc(lx, src) {
   }
 
   // Mask out other blocks: link (needs '['), code (needs '`'), html (needs '<')
-  if (maskedSrc.indexOf('[') !== -1 || maskedSrc.indexOf('`') !== -1 || maskedSrc.indexOf('<') !== -1) {
+  // The guard tests the masked string: earlier masks may have removed a '<'
+  // (a masked html span) or added one nothing else can remove, so this is
+  // scanned after the passes above rather than fused with the src scan.
+  let mbBracket = false;
+  let mbBacktick = false;
+  let mbLt = false;
+  for (let i = 0; i < maskedSrc.length; i++) {
+    const cc = maskedSrc.charCodeAt(i);
+    if (cc === 91) mbBracket = true; // [
+    else if (cc === 96) mbBacktick = true; // `
+    else if (cc === 60) mbLt = true; // <
+  }
+  if (mbBracket || mbBacktick || mbLt) {
     maskedSrc = maskedSrc.replace(inline.blockSkip, (match0, _link, context) => {
       const offset = context ? context.length : 0;
       return match0.slice(0, offset) + '[' + 'a'.repeat(match0.length - offset - 2) + ']';
@@ -2165,8 +2233,7 @@ function inlineTokensRun(lx, src, tokens = []) {
 function inlineTokensInner(lx, src, tokens) {
   // The masked source is only read by emStrong and del, which need a *, _ or
   // ~ to start. Skip building it for a run without one.
-  const needMask = src.includes('*') || src.includes('_') || src.includes('~');
-  if (needMask) {
+  if (hasEmDelim(src)) {
     const maskedSrc = maskSrc(lx, src);
 
     // One scan of this maskedSrc for the last emphasis, strong, and
