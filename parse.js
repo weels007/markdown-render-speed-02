@@ -697,6 +697,61 @@ function cachedLastPossibleDelCloserIndex(lx, maskedSrc) {
   return scanLastPossibleEmStrongDelClosers(maskedSrc).lastPossibleDelCloserIndex;
 }
 
+// Code-point counting without the array a spread allocates. Delimiter runs are
+// ASCII, so the only thing that changes the count is a surrogate pair.
+function cpLen(s) {
+  const len = s.length;
+  let n = len;
+  for (let i = 0; i < len; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0xDC00 && c <= 0xDFFF && i > 0) {
+      const p = s.charCodeAt(i - 1);
+      if (p >= 0xD800 && p <= 0xDBFF) n--;
+    }
+  }
+  return n;
+}
+
+// Length in code units of the first code point of s.
+function firstCpLen(s) {
+  const c = s.charCodeAt(0);
+  return c >= 0xD800 && c <= 0xDBFF && s.length > 1
+    && s.charCodeAt(1) >= 0xDC00 && s.charCodeAt(1) <= 0xDFFF ? 2 : 1;
+}
+
+// Equivalent to inline.punctuation.exec(ch) for a single code point, but with
+// a char-code fast path for ASCII (the regex uses unicode property escapes).
+function isPunctChar(ch) {
+  if (!ch) return false;
+  const c = ch.charCodeAt(0);
+  if (c > 127) return !!inline.punctuation.exec(ch);
+  return c === 32 || (c >= 9 && c <= 13)
+    || (c >= 33 && c <= 47 && c !== 42)
+    || (c >= 58 && c <= 64)
+    || (c >= 91 && c <= 96 && c !== 95)
+    || (c >= 123 && c <= 126);
+}
+
+// Equivalent to other.unicodeAlphaNumeric.test(ch) for a single code point.
+function isAlphaNumericChar(ch) {
+  if (!ch) return false;
+  const c = ch.charCodeAt(0);
+  if (c > 127) return other.unicodeAlphaNumeric.test(ch);
+  return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+}
+
+// The code point ending just before pos (the last element of
+// [...src.slice(0, pos)]), without building the slice or the array.
+function codePointBefore(src, pos) {
+  if (pos <= 0) return '';
+  const c = src.charCodeAt(pos - 1);
+  if (c >= 0xDC00 && c <= 0xDFFF && pos >= 2) {
+    const p = src.charCodeAt(pos - 2);
+    if (p >= 0xD800 && p <= 0xDBFF) return src.slice(pos - 2, pos);
+  }
+  return src.charAt(pos - 1);
+}
+
 function expandTabs(line, indent = 0) {
   let col = indent;
   let expanded = '';
@@ -940,27 +995,16 @@ function blockquoteToken(lx, src) {
 // sense (WhiteSpace or LineTerminator); replaces `!s.trim()` without
 // allocating the trimmed substring.
 function isBlankLine(s) {
-  for (let i = 0; i < s.length; i++) {
-    const cc = s.charCodeAt(i);
-    if (cc === 32 || cc === 9 || cc === 10 || cc === 11 || cc === 12 || cc === 13
-      || cc === 0xA0 || cc === 0x1680 || (cc >= 0x2000 && cc <= 0x200A)
-      || cc === 0x2028 || cc === 0x2029 || cc === 0x202F || cc === 0x205F
-      || cc === 0x3000 || cc === 0xFEFF) {
-      continue;
-    }
-    return false;
-  }
-  return true;
+  // String.prototype.trim removes exactly the WhiteSpace + LineTerminator set
+  // the old char loop enumerated.
+  return s.trim().length === 0;
 }
 
 // Same verdict as `src.includes('*') || src.includes('_') || src.includes('~')`
 // in a single scan.
 function hasEmDelim(src) {
-  for (let i = 0; i < src.length; i++) {
-    const cc = src.charCodeAt(i);
-    if (cc === 42 || cc === 95 || cc === 126) return true;
-  }
-  return false;
+  // Native scans beat a charCodeAt loop for the long paragraphs in the docs.
+  return src.includes('*') || src.includes('_') || src.includes('~');
 }
 
 function firstLineOf(src) {
@@ -968,13 +1012,24 @@ function firstLineOf(src) {
   return nl === -1 ? src : src.slice(0, nl);
 }
 
-// index of the first character that is not a space, or -1 (same as
-// str.search(/[^ ]/) but without the regex call)
-function indexOfNonSpace(str) {
-  for (let i = 0; i < str.length; i++) {
-    if (str.charCodeAt(i) !== 32) return i;
+// Same verdict as indexOfNonSpace(line.replace(/\t/g, '    ')) >= 4, without
+// building the replaced string. All-whitespace lines give -1 in the original.
+function hasFourIndent(s) {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 32) n++;
+    else if (c === 9) n += 4;
+    else return n >= 4;
   }
-  return -1;
+  return false;
+}
+
+const nonSpaceRe = /[^ ]/;
+
+// index of the first character that is not an ASCII space, or -1
+function indexOfNonSpace(str) {
+  return str.search(nonSpaceRe);
 }
 
 // The character a `^ {0,n}X` rule would test: the first non-space character at
@@ -984,6 +1039,17 @@ function indentChar(line, n) {
   let i = 0;
   while (i < n && line.charCodeAt(i) === 32) i++;
   return i <= n ? line.charCodeAt(i) : -1;
+}
+
+// Same verdict as /\n[ \t]*\n[ \t]*$/.test(raw): the string ends with a
+// newline, optional spaces/tabs, another newline, optional spaces/tabs.
+function endsDoubleBlankLine(raw) {
+  let i = raw.length - 1;
+  while (i >= 0 && (raw.charCodeAt(i) === 32 || raw.charCodeAt(i) === 9)) i--;
+  if (i < 0 || raw.charCodeAt(i) !== 10) return false;
+  i--;
+  while (i >= 0 && (raw.charCodeAt(i) === 32 || raw.charCodeAt(i) === 9)) i--;
+  return i >= 0 && raw.charCodeAt(i) === 10;
 }
 
 function listToken(lx, src) {
@@ -1130,8 +1196,7 @@ function listToken(lx, src) {
             }
 
             // paragraph continuation unless last line was a different block level element
-            const tIdx = indexOfNonSpace(line.replace(other.tabCharGlobal, '    '));
-            if (tIdx !== -1 && tIdx >= 4) { // indented code block
+            if (hasFourIndent(line)) { // indented code block
               break;
             }
             const lineLead = indentChar(line, nEff);
@@ -1174,7 +1239,7 @@ function listToken(lx, src) {
         // If the previous item ended with a blank line, the list is loose
         if (endsWithBlankLine) {
           list.loose = true;
-        } else if (other.doubleBlankLine.test(raw)) {
+        } else if (endsDoubleBlankLine(raw)) {
           endsWithBlankLine = true;
         }
       }
@@ -1639,23 +1704,22 @@ function emStrongToken(lx, src, maskedSrc, prevChar = '') {
   while (runStart > 0 && maskedSrc[runStart - 1] === delimChar) {
     runStart--;
   }
-  const runPrevChars = [...maskedSrc.slice(Math.max(0, runStart - 2), runStart)];
-  const runPrevChar = runPrevChars.length > 0 ? runPrevChars[runPrevChars.length - 1] : '';
+  const runPrevChar = codePointBefore(maskedSrc, runStart);
   // The other delimiter character counts as punctuation here (`_**a*`)
-  const runPrevPunct = runPrevChar === '*' || runPrevChar === '_' || !!inline.punctuation.exec(runPrevChar);
+  const runPrevPunct = runPrevChar === '*' || runPrevChar === '_' || isPunctChar(runPrevChar);
   if (runStart < srcStart) {
     prevChar = runPrevChar;
   }
-  const prevPunct = runStart < srcStart ? runPrevPunct : !!inline.punctuation.exec(prevChar);
+  const prevPunct = runStart < srcStart ? runPrevPunct : isPunctChar(prevChar);
 
   // _ can't be between two alphanumerics. \p{L}\p{N} includes non-english alphabet/numbers as well
-  if (match[4] && prevChar.match(other.unicodeAlphaNumeric)) return;
+  if (match[4] && isAlphaNumericChar(prevChar)) return;
 
   const nextChar = match[1] || match[3] || '';
 
   if (!nextChar || !prevChar || prevPunct) {
-    // unicode Regex counts emoji as 1 char; spread into array for proper count (used multiple times below)
-    const lLength = [...match[0]].length - 1;
+    // Count code points, not UTF-16 units: a regex match can hold an astral char.
+    const lLength = cpLen(match[0]) - 1;
     let rDelim, rLength, delimTotal = lLength, midDelimTotal = 0;
 
     // Rules 9-10 count the whole run, and also apply when the opener could
@@ -1679,7 +1743,8 @@ function emStrongToken(lx, src, maskedSrc, prevChar = '') {
 
       if (!rDelim) continue; // skip single * in __abc*abc__
 
-      rLength = [...rDelim].length;
+      // rDelim is always a run of the ASCII delimiter (*, _ or ~).
+      rLength = rDelim.length;
 
       if (match[3] || match[4]) { // found another Left Delim
         delimTotal += rLength;
@@ -1703,7 +1768,7 @@ function emStrongToken(lx, src, maskedSrc, prevChar = '') {
       // Remove extra characters. *a*** -> *a*
       rLength = Math.min(rLength, rLength + delimTotal + midDelimTotal);
       // char length can be >1 for unicode characters;
-      const lastCharLength = [...match[0]][0].length;
+      const lastCharLength = firstCpLen(match[0]);
       const raw = src.slice(0, lLength + match.index + lastCharLength + rLength);
 
       // Create `em` if smallest delimiter has odd char count. *a***
@@ -1762,9 +1827,9 @@ function delToken(lx, src, maskedSrc, prevChar = '') {
 
   const nextChar = match[1] || '';
 
-  if (!nextChar || !prevChar || inline.punctuation.exec(prevChar)) {
-    // unicode Regex counts emoji as 1 char; spread into array for proper count
-    const lLength = [...match[0]].length - 1;
+  if (!nextChar || !prevChar || isPunctChar(prevChar)) {
+    // Count code points, not UTF-16 units: a regex match can hold an astral char.
+    const lLength = cpLen(match[0]) - 1;
     let rDelim, rLength, delimTotal = lLength;
 
     const endReg = inline.delRDelim;
@@ -1782,7 +1847,8 @@ function delToken(lx, src, maskedSrc, prevChar = '') {
 
       if (!rDelim) continue;
 
-      rLength = [...rDelim].length;
+      // rDelim is always a run of the ASCII delimiter (*, _ or ~).
+      rLength = rDelim.length;
 
       if (rLength !== lLength) continue;
 
@@ -1798,7 +1864,7 @@ function delToken(lx, src, maskedSrc, prevChar = '') {
       // Remove extra characters
       rLength = Math.min(rLength, rLength + delimTotal);
       // char length can be >1 for unicode characters
-      const lastCharLength = [...match[0]][0].length;
+      const lastCharLength = firstCpLen(match[0]);
       const raw = src.slice(0, lLength + match.index + lastCharLength + rLength);
 
       // Create del token - only single ~ or double ~~ supported
@@ -1884,12 +1950,14 @@ function inlineTextToken(lx, src) {
   const cap = inline.text.exec(src);
   if (cap) {
     const escaped = lx.inRawBlock;
+    const raw = cap[0];
     return {
       type: 'text',
-      raw: cap[0],
+      raw,
       // raw HTML keeps whatever it was written with, everywhere else a numeric
-      // character reference stands for the character itself
-      text: escaped ? cap[0] : decodeNumericCharacterReferences(cap[0]),
+      // character reference stands for the character itself. No '&' means the
+      // numeric-reference regex cannot match, so skip it entirely.
+      text: escaped || !raw.includes('&') ? raw : decodeNumericCharacterReferences(raw),
       escaped,
     };
   }
@@ -1975,17 +2043,10 @@ function maskSrc(lx, src) {
   // One scan of src for the characters the pass guards below test. The
   // reflink search needs '[' and ']' and, because every candidate it cannot
   // resolve is returned unchanged, also a link definition to be worth a pass.
-  let hasBracket = false;
-  let hasRBracket = false;
-  let hasBackslash = false;
-  let hasBacktick = false;
-  for (let i = 0; i < src.length; i++) {
-    const cc = src.charCodeAt(i);
-    if (cc === 91) hasBracket = true; // [
-    else if (cc === 92) hasBackslash = true; // \
-    else if (cc === 96) hasBacktick = true; // `
-    else if (cc === 93) hasRBracket = true; // ]
-  }
+  const hasBracket = src.includes('[');
+  const hasRBracket = src.includes(']');
+  const hasBackslash = src.includes('\\');
+  const hasBacktick = src.includes('`');
 
   // Mask out reflinks
   if (hasBracket && hasRBracket && lx.linkCount > 0) {
@@ -2037,24 +2098,15 @@ function maskSrc(lx, src) {
   // string: earlier masks may have removed a '<' (a masked html span) or an
   // escaped bracket, so this is scanned after the passes above rather than
   // fused with the src scan.
-  let mbBracket = false; // [
-  let mbRBracket = false; // ]
-  let mbParen = false; // (
-  let mbRParen = false; // )
-  let mbLt = false; // <
-  let mbGt = false; // >
-  let mbTicks = 0; // `
-  for (let i = 0; i < maskedSrc.length; i++) {
-    const cc = maskedSrc.charCodeAt(i);
-    if (cc === 91) mbBracket = true;
-    else if (cc === 93) mbRBracket = true;
-    else if (cc === 40) mbParen = true;
-    else if (cc === 41) mbRParen = true;
-    else if (cc === 60) mbLt = true;
-    else if (cc === 62) mbGt = true;
-    else if (cc === 96) mbTicks++;
-  }
-  if ((mbBracket && mbRBracket && mbParen && mbRParen) || mbTicks >= 2 || (mbLt && mbGt)) {
+  const mbBracket = maskedSrc.includes('[');
+  const mbRBracket = maskedSrc.includes(']');
+  const mbParen = maskedSrc.includes('(');
+  const mbRParen = maskedSrc.includes(')');
+  const mbLt = maskedSrc.includes('<');
+  const mbGt = maskedSrc.includes('>');
+  const firstTick = maskedSrc.indexOf('`');
+  const twoTicks = firstTick !== -1 && maskedSrc.indexOf('`', firstTick + 1) !== -1;
+  if ((mbBracket && mbRBracket && mbParen && mbRParen) || twoTicks || (mbLt && mbGt)) {
     maskedSrc = maskedSrc.replace(inline.blockSkip, (match0, _link, context) => {
       const offset = context ? context.length : 0;
       return match0.slice(0, offset) + '[' + 'a'.repeat(match0.length - offset - 2) + ']';
